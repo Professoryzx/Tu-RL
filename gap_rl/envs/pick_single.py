@@ -9,6 +9,7 @@ import open3d as o3d
 import sapien.core as sapien
 from gap_rl import ASSET_DIR, format_path
 from gap_rl.agents.base_agent import BaseAgent
+from gap_rl.agents.robots.unitree_g1_dualarm import UnitreeG1DualArm
 from gap_rl.agents.robots.ur5e_robotiq85_old import UR5e_Robotiq85_old
 from gap_rl.sensors.camera import CameraConfig
 from gap_rl.utils.common import (
@@ -75,8 +76,9 @@ class PickSingleEnv(BaseEnv):
     SUPPORTED_REWARD_MODES = ("dense", "sparse")
     SUPPORTED_ROBOTS = {
         "ur5e_robotiq85_old": UR5e_Robotiq85_old,
+        "unitree_g1_dualarm": UnitreeG1DualArm,
     }
-    agent: Union[UR5e_Robotiq85_old]
+    agent: Union[UR5e_Robotiq85_old, UnitreeG1DualArm]
 
     obj: sapien.Actor  # target object
 
@@ -139,7 +141,8 @@ class PickSingleEnv(BaseEnv):
         self.cam_paras = OrderedDict()
 
         self.robot_uid = robot
-        self.gripper_w = 0.0425 if "85" in robot else 0.068
+        self._default_gripper_w = 0.0425 if "85" in robot else 0.068
+        self.gripper_w = self._default_gripper_w
         self.robot_init_qpos_noise = robot_init_qpos_noise
         self.contact_flag = False
         self.grasps_mat = None
@@ -147,15 +150,8 @@ class PickSingleEnv(BaseEnv):
         assert grasp_points_mode in ["gauss", "keypoints", "gauss_fix", "uniform"], "not support mode! "
         self.grasp_points_mode = grasp_points_mode
         self.num_grasp_points = num_grasp_points
-        self.gripper_pts = sample_grasp_points_ee(
-            [self.gripper_w, self.gripper_w], z_offset=0.02
-        )  # gripper keypoints, (6, 3)
-        self.gripper_pts_rect = sample_grasp_keypoints_ee(
-            gripper_w=self.gripper_w,
-            num_points_perlink=int(self.num_grasp_points / 4)
-        )
-        fix_gauss_rng = np.random.RandomState(1029)
-        self.gripper_pts_gauss = fix_gauss_rng.normal(0.0, self.gripper_w/3, size=(num_grasp_points, 3))
+        self._gripper_template_seed = 1029
+        self._configure_gripper_templates(self.gripper_w)
         self.grasps_mat_ee = np.zeros((num_grasps, 4, 4))
         self.grasps_scores = np.zeros(num_grasps)
         self.pred_grasp_actor_critic = None
@@ -173,6 +169,19 @@ class PickSingleEnv(BaseEnv):
     def _check_assets(self):
         """Check whether the assets exist."""
         pass
+
+    def _configure_gripper_templates(self, width: float):
+        self.gripper_w = width
+        self.gripper_pts = sample_grasp_points_ee(
+            [width, width], z_offset=0.02
+        )  # gripper keypoints, (6, 3)
+        self.gripper_pts_rect = sample_grasp_keypoints_ee(
+            gripper_w=width, num_points_perlink=int(self.num_grasp_points / 4)
+        )
+        rng = np.random.RandomState(self._gripper_template_seed)
+        self.gripper_pts_gauss = rng.normal(
+            0.0, width / 3, size=(self.num_grasp_points, 3)
+        )
 
     def _build_sphere_site(self, radius, color=(0, 1, 0), name="goal_site"):
         """Build a sphere site (visual only)."""
@@ -257,9 +266,19 @@ class PickSingleEnv(BaseEnv):
         self.agent = agent_cls(
             self._scene, self._control_freq, self._control_mode, config=self._agent_cfg
         )
-        self.tcp: sapien.Link = get_entity_by_name(
-            self.agent.robot.get_links(), self.agent.config.ee_link_name
+        if hasattr(self.agent, "primary_ee_link"):
+            self.tcp = self.agent.primary_ee_link
+        else:
+            self.tcp = get_entity_by_name(
+                self.agent.robot.get_links(), self.agent.config.ee_link_name
+            )
+        self.available_hands = getattr(self.agent, "hands", None)
+        self.primary_hand = getattr(self.agent, "primary_hand", None)
+        primary_gripper_width = getattr(
+            self.agent, "primary_gripper_width", self.gripper_w
         )
+        if abs(primary_gripper_width - self.gripper_w) > 1e-6:
+            self._configure_gripper_templates(primary_gripper_width)
         set_articulation_render_material(self.agent.robot, specular=0.9, roughness=0.3)
         if self.robot_uid == "panda":
             pass
@@ -287,12 +306,20 @@ class PickSingleEnv(BaseEnv):
             self.agent._add_constraints()
         elif self.robot_uid in ["ur5e_robotiq140_old", "ur5e_robotiq85_old"]:
             pass
+        elif self.robot_uid == "unitree_g1_dualarm":
+            qpos = np.zeros(self.agent.robot.dof)
+            self.agent.reset(qpos)
+            self.agent.robot.set_pose(Pose())
         else:
             raise NotImplementedError(self.robot_uid)
         if self.robot_uid == "panda" or self.robot_uid == "xmate3_robotiq":
             self.num_joints = 7
         elif self.robot_uid in ["ur5e_robotiq140", "ur5e_robotiq140_old", "ur5e_robotiq85", "ur5e_robotiq85_old"]:
             self.num_joints = 6
+        elif self.robot_uid == "unitree_g1_dualarm":
+            self.num_joints = len(getattr(self.agent.config, "arm_joint_names", []))
+            if self.num_joints == 0:
+                self.num_joints = self.agent.robot.dof - len(self.agent.gripper_joint_ids)
         else:
             raise NotImplementedError
 
